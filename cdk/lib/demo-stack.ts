@@ -1,14 +1,16 @@
 // =====================================================================
-// B案アーキテクチャ 個人検証スタック
+// B案アーキテクチャ 個人検証スタック【完全形】
 //
 //   ブラウザ
-//     └─ CloudFront（唯一の入口）
+//     └─ CloudFront + WAF（唯一の入口）
 //          ├─ /*      → S3 プライベートバケット + OAC（React SPA）
-//          └─ /api/*  → HTTP API Gateway（x-origin-verify ヘッダ付与）
-//                          └─ VPC Link → Cloud Map → ECS Fargate
-//                               [FastAPI コンテナ + PostgreSQL サイドカー]
+//          └─ /api/*  → HTTP API Gateway（x-origin-verify 検証あり / throttling）
+//                          └─ VPC Link → Cloud Map → ECS Fargate（プライベートサブネット）
+//                               [FastAPI + PostgreSQL サイドカー]
+//   機械間: /internal/ping は IAM(SigV4) 認証（API Key は使わない）
 //
-//   コスト最小化: NATなし / ALBなし / RDSなし（PGはサイドカー・データ揮発）
+//   コスト注意: NAT Gateway(~$45/月) + WAF(~$7/月) + Fargate(~$18/月)
+//               検証が終わったら必ず destroy すること
 // =====================================================================
 import * as cdk from "aws-cdk-lib";
 import { Construct } from "constructs";
@@ -21,36 +23,47 @@ import * as cloudfront from "aws-cdk-lib/aws-cloudfront";
 import * as origins from "aws-cdk-lib/aws-cloudfront-origins";
 import * as apigwv2 from "aws-cdk-lib/aws-apigatewayv2";
 import { HttpServiceDiscoveryIntegration } from "aws-cdk-lib/aws-apigatewayv2-integrations";
+import { HttpIamAuthorizer } from "aws-cdk-lib/aws-apigatewayv2-authorizers";
 import * as servicediscovery from "aws-cdk-lib/aws-servicediscovery";
 import * as secretsmanager from "aws-cdk-lib/aws-secretsmanager";
 import * as logs from "aws-cdk-lib/aws-logs";
 import * as path from "path";
 
+export interface DemoStackProps extends cdk.StackProps {
+  /** us-east-1 の WafStack が出力する WebACL ARN */
+  readonly webAclArn: string;
+}
+
 export class DemoStack extends cdk.Stack {
-  constructor(scope: Construct, id: string, props?: cdk.StackProps) {
+  constructor(scope: Construct, id: string, props: DemoStackProps) {
     super(scope, id, props);
 
+    // CloudFront → オリジン検証用の秘密ヘッダ値（cdk.json context で差し替え可能）
+    const originVerifySecret: string =
+      this.node.tryGetContext("originVerifySecret") ??
+      "ov-4f8Zr2Kq9mDempPz71xWcYb3";
+
     // ------------------------------------------------------------
-    // 1. VPC（パブリックサブネットのみ・NATなしでコスト0）
-    //    Fargate は assignPublicIp でイメージを取得する
+    // 1. VPC: パブリック(NAT/入口用) + プライベート(ECS実行用)
+    //    NAT Gateway 1台（~$45/月。検証後は destroy！）
     // ------------------------------------------------------------
     const vpc = new ec2.Vpc(this, "Vpc", {
       maxAzs: 2,
-      natGateways: 0,
+      natGateways: 1,
       subnetConfiguration: [
         { name: "public", subnetType: ec2.SubnetType.PUBLIC },
+        { name: "private", subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS },
       ],
     });
 
     // ------------------------------------------------------------
-    // 2. ECS クラスタ + Cloud Map 名前空間（VPC Link のターゲット）
+    // 2. ECS クラスタ + Cloud Map 名前空間
     // ------------------------------------------------------------
     const cluster = new ecs.Cluster(this, "Cluster", { vpc });
     const namespace = cluster.addDefaultCloudMapNamespace({
       name: "demo.local",
     });
 
-    // JWT 秘密鍵は Secrets Manager で自動生成（コードに書かない）
     const jwtSecret = new secretsmanager.Secret(this, "JwtSecret", {
       description: "sons02-demo01 JWT secret",
       generateSecretString: { excludePunctuation: true, passwordLength: 48 },
@@ -62,7 +75,7 @@ export class DemoStack extends cdk.Stack {
     });
 
     // ------------------------------------------------------------
-    // 3. タスク定義: FastAPI + PostgreSQL サイドカー（同一タスク内 = localhost 通信）
+    // 3. タスク定義: FastAPI + PostgreSQL サイドカー
     // ------------------------------------------------------------
     const taskDef = new ecs.FargateTaskDefinition(this, "TaskDef", {
       cpu: 512,
@@ -75,7 +88,7 @@ export class DemoStack extends cdk.Stack {
       ),
       environment: {
         POSTGRES_USER: "ses",
-        POSTGRES_PASSWORD: "ses_pass_demo", // 検証用（タスク内 localhost のみ、外部露出なし）
+        POSTGRES_PASSWORD: "ses_pass_demo",
         POSTGRES_DB: "ses",
       },
       healthCheck: {
@@ -88,7 +101,6 @@ export class DemoStack extends cdk.Stack {
       memoryReservationMiB: 256,
     });
 
-    // バックエンドイメージは sons02 でビルドして ECR に push 済みのものを参照
     const repo = ecr.Repository.fromRepositoryName(
       this,
       "BackendRepo",
@@ -101,8 +113,10 @@ export class DemoStack extends cdk.Stack {
         DATABASE_URL: "postgresql+psycopg://ses:ses_pass_demo@localhost:5432/ses",
         JWT_EXPIRE_MINUTES: "60",
         ADMIN_EMAIL: "admin@example.com",
-        ADMIN_PASSWORD: "Demo2026!", // 検証用。README 参照
-        CORS_ORIGINS: "http://localhost", // 同一オリジン構成のため CORS は実質不使用
+        ADMIN_PASSWORD: "Demo2026!",
+        CORS_ORIGINS: "http://localhost",
+        // CloudFront 以外からの直アクセスを 403 にする（main.py のミドルウェアが検証）
+        ORIGIN_VERIFY_SECRET: originVerifySecret,
       },
       secrets: {
         JWT_SECRET: ecs.Secret.fromSecretsManager(jwtSecret),
@@ -111,27 +125,26 @@ export class DemoStack extends cdk.Stack {
       logging: ecs.LogDrivers.awsLogs({ streamPrefix: "api", logGroup }),
     });
 
-    // DB が healthy になってから API を起動（entrypoint.sh の待機と二重の保険）
     apiContainer.addContainerDependencies({
       container: dbContainer,
       condition: ecs.ContainerDependencyCondition.HEALTHY,
     });
 
     // ------------------------------------------------------------
-    // 4. Fargate サービス + Cloud Map(SRV) 登録
+    // 4. Fargate サービス（プライベートサブネット・公開IPなし）
     // ------------------------------------------------------------
     const serviceSg = new ec2.SecurityGroup(this, "ServiceSg", {
       vpc,
       description: "Fargate service SG",
-      allowAllOutbound: true,
+      allowAllOutbound: true, // ECR pull / Secrets / 将来の Gemini API 呼び出しは NAT 経由
     });
 
     const service = new ecs.FargateService(this, "Service", {
       cluster,
       taskDefinition: taskDef,
       desiredCount: 1,
-      assignPublicIp: true, // NATなしでECR/公開レジストリからpullするため
-      vpcSubnets: { subnetType: ec2.SubnetType.PUBLIC },
+      assignPublicIp: false, // プライベート化。外向きは NAT 経由
+      vpcSubnets: { subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS },
       securityGroups: [serviceSg],
       cloudMapOptions: {
         name: "api",
@@ -140,23 +153,23 @@ export class DemoStack extends cdk.Stack {
         container: apiContainer,
         containerPort: 8000,
       },
-      minHealthyPercent: 0, // 検証用: 1タスク構成なので置き換え時は一旦0でよい
+      minHealthyPercent: 0,
     });
 
     // ------------------------------------------------------------
-    // 5. HTTP API Gateway + VPC Link → Cloud Map（ALB不要でコスト0）
+    // 5. HTTP API Gateway + VPC Link（SG は「SG参照」で連鎖させる）
     // ------------------------------------------------------------
     const vpcLinkSg = new ec2.SecurityGroup(this, "VpcLinkSg", {
       vpc,
       description: "API GW VPC Link SG",
       allowAllOutbound: true,
     });
-    // SG の連鎖: VPC Link からのみ 8000 を許可（IP直書きしない）
+    // SG 連鎖: VPC Link の SG からのみ 8000 を許可（IP 直書きしない）
     serviceSg.addIngressRule(vpcLinkSg, ec2.Port.tcp(8000), "from VPC Link");
 
     const vpcLink = new apigwv2.VpcLink(this, "VpcLink", {
       vpc,
-      subnets: { subnetType: ec2.SubnetType.PUBLIC },
+      subnets: { subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS },
       securityGroups: [vpcLinkSg],
     });
 
@@ -164,33 +177,53 @@ export class DemoStack extends cdk.Stack {
       apiName: "sons02-demo01-api",
     });
 
+    const backendIntegration = new HttpServiceDiscoveryIntegration(
+      "Backend",
+      service.cloudMapService!,
+      { vpcLink }
+    );
+
+    // ユーザー向け API（現状はアプリ内蔵JWT。Okta 登録後に JWT authorizer を追加予定）
     httpApi.addRoutes({
       path: "/api/{proxy+}",
       methods: [apigwv2.HttpMethod.ANY],
-      integration: new HttpServiceDiscoveryIntegration(
-        "Backend",
-        service.cloudMapService!,
-        { vpcLink }
-      ),
+      integration: backendIntegration,
     });
 
+    // 機械間ルート: IAM(SigV4) 認証。API Key は使わない方針のデモ
+    httpApi.addRoutes({
+      path: "/internal/ping",
+      methods: [apigwv2.HttpMethod.GET],
+      integration: backendIntegration,
+      authorizer: new HttpIamAuthorizer(),
+    });
+
+    // Stage throttling（従量課金 LLM の暴走対策の二層目）
+    const defaultStage = httpApi.defaultStage!.node
+      .defaultChild as apigwv2.CfnStage;
+    defaultStage.defaultRouteSettings = {
+      throttlingRateLimit: 50, // 定常 50 req/s
+      throttlingBurstLimit: 100, // バースト 100
+    };
+
     // ------------------------------------------------------------
-    // 6. S3（プライベート + OAC） + CloudFront
+    // 6. S3（プライベート + OAC） + CloudFront + WAF
     // ------------------------------------------------------------
     const siteBucket = new s3.Bucket(this, "SiteBucket", {
       blockPublicAccess: s3.BlockPublicAccess.BLOCK_ALL,
-      removalPolicy: cdk.RemovalPolicy.DESTROY, // 検証用: destroy で消す
+      encryption: s3.BucketEncryption.S3_MANAGED, // L2情報想定の保存時暗号化
+      enforceSSL: true, // 転送時暗号化の強制
+      removalPolicy: cdk.RemovalPolicy.DESTROY,
       autoDeleteObjects: true,
     });
 
-    // API GW のドメイン部分だけ取り出す（https://xxx.execute-api... → xxx.execute-api...）
     const apiDomain = cdk.Fn.select(2, cdk.Fn.split("/", httpApi.apiEndpoint));
 
     const distribution = new cloudfront.Distribution(this, "Distribution", {
       comment: "sons02-demo01 (B-plan practice)",
       defaultRootObject: "index.html",
+      webAclId: props.webAclArn, // ← us-east-1 の WAF を装着
       defaultBehavior: {
-        // LIST 権限も付与 → 存在しないキーは 403 でなく 404 になり SPA フォールバックが正しく効く
         origin: origins.S3BucketOrigin.withOriginAccessControl(siteBucket, {
           originAccessLevels: [
             cloudfront.AccessLevel.READ,
@@ -203,8 +236,7 @@ export class DemoStack extends cdk.Stack {
       additionalBehaviors: {
         "/api/*": {
           origin: new origins.HttpOrigin(apiDomain, {
-            // 本番では API GW 側でこのヘッダを検証して「CloudFront経由以外」を遮断する
-            customHeaders: { "x-origin-verify": "demo-secret-change-me" },
+            customHeaders: { "x-origin-verify": originVerifySecret },
           }),
           viewerProtocolPolicy:
             cloudfront.ViewerProtocolPolicy.REDIRECT_TO_HTTPS,
@@ -214,7 +246,6 @@ export class DemoStack extends cdk.Stack {
             cloudfront.OriginRequestPolicy.ALL_VIEWER_EXCEPT_HOST_HEADER,
         },
       },
-      // SPA ルーティング: 未知パスは index.html を 200 で返す
       errorResponses: [
         {
           httpStatus: 404,
@@ -232,10 +263,12 @@ export class DemoStack extends cdk.Stack {
     });
 
     // ------------------------------------------------------------
-    // 7. フロントエンド資産のデプロイ（frontend/dist を事前ビルドしておくこと）
+    // 7. フロントエンド資産のデプロイ
     // ------------------------------------------------------------
     new s3deploy.BucketDeployment(this, "DeploySite", {
-      sources: [s3deploy.Source.asset(path.join(__dirname, "../../frontend/dist"))],
+      sources: [
+        s3deploy.Source.asset(path.join(__dirname, "../../frontend/dist")),
+      ],
       destinationBucket: siteBucket,
       distribution,
       distributionPaths: ["/*"],
@@ -250,7 +283,7 @@ export class DemoStack extends cdk.Stack {
     });
     new cdk.CfnOutput(this, "ApiEndpoint", {
       value: httpApi.apiEndpoint,
-      description: "API GW 直エンドポイント（本番では直アクセス遮断対象）",
+      description: "API GW 直エンドポイント（直叩きは 403 になる）",
     });
     new cdk.CfnOutput(this, "AdminLogin", {
       value: "admin@example.com / Demo2026!",
