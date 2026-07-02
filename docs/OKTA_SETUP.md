@@ -21,10 +21,10 @@
    - App integration name: `sons02-demo01`
    - Grant type: **Authorization Code** 勾选（PKCE 对 SPA 自动强制，无需 client secret）
    - **Sign-in redirect URIs**:
-     - `https://d1cnlo8n0t8l8j.cloudfront.net/login/callback`
+     - `https://dbpjuxqqoguc5.cloudfront.net/login/callback`
      - `http://localhost:5173/login/callback` （本地开发用）
    - **Sign-out redirect URIs**:
-     - `https://d1cnlo8n0t8l8j.cloudfront.net`
+     - `https://dbpjuxqqoguc5.cloudfront.net`
      - `http://localhost:5173`
    - Assignments: 先选 **Allow everyone in your organization to access**（个人环境只有你一人）
 4. Save 后记下 **Client ID**（形如 `0oa...`，**= 值B**）
@@ -33,7 +33,7 @@
 
 1. **Security → API → Trusted Origins → Add Origin**
 2. 添加：
-   - Origin: `https://d1cnlo8n0t8l8j.cloudfront.net`，勾选 CORS + Redirect
+   - Origin: `https://dbpjuxqqoguc5.cloudfront.net`，勾选 CORS + Redirect
    - Origin: `http://localhost:5173`，勾选 CORS + Redirect
 
 ## Step 4. 确认授权服务器（Issuer）
