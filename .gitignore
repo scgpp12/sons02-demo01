@@ -1,0 +1,9 @@
+node_modules/
+dist/
+cdk.out/
+__pycache__/
+*.egg-info/
+.venv/
+.env
+*.log
+.DS_Store

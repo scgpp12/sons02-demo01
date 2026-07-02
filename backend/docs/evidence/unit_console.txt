@@ -1,0 +1,28 @@
+============================= test session starts =============================
+platform win32 -- Python 3.10.11, pytest-9.1.0, pluggy-1.6.0
+rootdir: C:\Users\sons\Downloads\ses-web-20260618\ses-system\backend
+configfile: pyproject.toml
+plugins: anyio-4.14.0, cov-7.1.0
+collected 69 items
+
+tests\test_billing.py ....................                               [ 28%]
+tests\test_security.py ................                                  [ 52%]
+tests\test_deps.py ........                                              [ 63%]
+tests\test_crypto.py ......                                              [ 72%]
+tests\test_dateutil.py ..........                                        [ 86%]
+tests\test_rounding.py .........                                         [100%]
+
+- generated xml file: C:\Users\sons\Downloads\ses-web-20260618\ses-system\backend\docs\evidence\junit_unit.xml -
+=============================== tests coverage ================================
+______________ coverage: platform win32, python 3.10.11-final-0 _______________
+
+Name                    Stmts   Miss  Cover   Missing
+-----------------------------------------------------
+app\core\crypto.py         15      0   100%
+app\core\deps.py           34     11    68%   23-34, 44-49
+app\core\security.py       23      0   100%
+app\crud\billing.py        31      0   100%
+app\crud\dashboard.py      36     20    44%   32-79
+-----------------------------------------------------
+TOTAL                     139     31    78%
+============================= 69 passed in 3.53s ==============================
