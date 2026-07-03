@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { useNavigate } from "react-router-dom";
+import { Navigate, useNavigate } from "react-router-dom";
 
 import { errMessage } from "@/api/client";
 import { Button } from "@/components/ui/button";
@@ -10,12 +10,15 @@ import { useAuth } from "@/hooks/useAuth";
 import { oktaAuth } from "@/lib/okta";
 
 export function LoginPage() {
-  const { login } = useAuth();
+  const { user, login } = useAuth();
   const navigate = useNavigate();
   const [email, setEmail] = useState("admin@example.com");
   const [password, setPassword] = useState("");
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
+
+  // 認証済みならダッシュボードへ（Okta コールバック後のルート残留対策）
+  if (user) return <Navigate to="/" replace />;
 
   const onSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
