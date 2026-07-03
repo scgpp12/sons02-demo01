@@ -19,6 +19,10 @@ class Settings(BaseSettings):
     # CORS許可オリジン（カンマ区切り）
     cors_origins: str = "http://localhost:5173"
 
+    # Okta 認証（設定するとアプリ内蔵JWTの代わりにOktaトークンを検証する）
+    okta_issuer: str = ""  # 例: https://integrator-xxxx.okta.com/oauth2/default
+    okta_audience: str = "api://default"
+
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
     @property

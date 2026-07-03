@@ -5,7 +5,13 @@ from fastapi import Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer
 from sqlalchemy.orm import Session
 
-from app.core.security import decode_access_token
+import os
+
+from sqlalchemy import select
+
+from app.core.config import settings
+from app.core.okta import verify_okta_token
+from app.core.security import decode_access_token, hash_password
 from app.db.session import get_db
 from app.models.enums import UserRole
 from app.models.user import User
@@ -25,6 +31,33 @@ def get_current_user(
         detail="認証に失敗しました",
         headers={"WWW-Authenticate": "Bearer"},
     )
+    # --- Okta モード: RS256 検証 + email でユーザー突合 ---
+    if settings.okta_issuer:
+        claims = verify_okta_token(token)
+        if claims is None:
+            raise cred_exc
+        email = claims.get("sub")  # Okta default認可サーバーでは sub = ログインID(メール)
+        if not email:
+            raise cred_exc
+        user = db.execute(select(User).where(User.email == email)).scalar_one_or_none()
+        if user is None:
+            # 検証環境: 初回ログイン時に自動プロビジョニング。
+            # 個人検証のため admin 付与（本番では既定ロール + 管理者承認にすること）
+            user = User(
+                email=email,
+                name=email.split("@")[0],
+                role=UserRole.admin,
+                is_active=True,
+                password_hash=hash_password(os.urandom(16).hex()),
+            )
+            db.add(user)
+            db.commit()
+            db.refresh(user)
+        if not user.is_active:
+            raise cred_exc
+        return user
+
+    # --- 従来モード: アプリ内蔵JWT(HS256) ---
     sub = decode_access_token(token)
     if sub is None:
         raise cred_exc

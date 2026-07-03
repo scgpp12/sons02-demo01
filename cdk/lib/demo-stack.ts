@@ -23,7 +23,10 @@ import * as cloudfront from "aws-cdk-lib/aws-cloudfront";
 import * as origins from "aws-cdk-lib/aws-cloudfront-origins";
 import * as apigwv2 from "aws-cdk-lib/aws-apigatewayv2";
 import { HttpServiceDiscoveryIntegration } from "aws-cdk-lib/aws-apigatewayv2-integrations";
-import { HttpIamAuthorizer } from "aws-cdk-lib/aws-apigatewayv2-authorizers";
+import {
+  HttpIamAuthorizer,
+  HttpJwtAuthorizer,
+} from "aws-cdk-lib/aws-apigatewayv2-authorizers";
 import * as servicediscovery from "aws-cdk-lib/aws-servicediscovery";
 import * as secretsmanager from "aws-cdk-lib/aws-secretsmanager";
 import * as logs from "aws-cdk-lib/aws-logs";
@@ -42,6 +45,10 @@ export class DemoStack extends cdk.Stack {
     const originVerifySecret: string =
       this.node.tryGetContext("originVerifySecret") ??
       "ov-4f8Zr2Kq9mDempPz71xWcYb3";
+
+    // Okta（個人検証テナント）。本番では SBR の Okta に差し替える
+    const OKTA_ISSUER = "https://integrator-2363543.okta.com/oauth2/default";
+    const OKTA_AUDIENCE = "api://default";
 
     // ------------------------------------------------------------
     // 1. VPC: パブリック(NAT/入口用) + プライベート(ECS実行用)
@@ -117,6 +124,11 @@ export class DemoStack extends cdk.Stack {
         CORS_ORIGINS: "http://localhost",
         // CloudFront 以外からの直アクセスを 403 にする（main.py のミドルウェアが検証）
         ORIGIN_VERIFY_SECRET: originVerifySecret,
+        // Okta トークン検証（バックエンド側の多層防御）
+        OKTA_ISSUER: OKTA_ISSUER,
+        OKTA_AUDIENCE: OKTA_AUDIENCE,
+        // ダッシュボード用のデモデータを投入
+        SEED_DEMO: "1",
       },
       secrets: {
         JWT_SECRET: ecs.Secret.fromSecretsManager(jwtSecret),
@@ -183,11 +195,15 @@ export class DemoStack extends cdk.Stack {
       { vpcLink }
     );
 
-    // ユーザー向け API（現状はアプリ内蔵JWT。Okta 登録後に JWT authorizer を追加予定）
+    // ユーザー向け API: API GW 層で Okta JWT を検証（「験票」）
+    const oktaAuthorizer = new HttpJwtAuthorizer("OktaJwt", OKTA_ISSUER, {
+      jwtAudience: [OKTA_AUDIENCE],
+    });
     httpApi.addRoutes({
       path: "/api/{proxy+}",
       methods: [apigwv2.HttpMethod.ANY],
       integration: backendIntegration,
+      authorizer: oktaAuthorizer,
     });
 
     // 機械間ルート: IAM(SigV4) 認証。API Key は使わない方針のデモ
